@@ -1,0 +1,338 @@
+﻿#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public class MT5 : Strategy
+	{
+		// ===== NUCLEO-MT5 v1 BEGIN =====
+		// NUCLEO-MT5 v1 -- la regla del MT5 mejorado SIN NinjaTrader: solo ve barras de 1 minuto con su SELLO DE CIERRE en hora de
+		// Nueva York y dice que hacer al cierre de cada una. El arnes (cs\arnes) compila este bloque tal cual y lo cuadra con el motor.
+		//   rango  = barras que cierran en (15:25, 15:30] (velas que abren 15:25-15:29); tienen que estar las 5.
+		//   senal  = la PRIMERA barra que cierra en (15:30, 15:35] (velas que abren 15:30-15:34) con cierre FUERA del rango, estricto:
+		//            cierre < minimo => COMPRAR (al cierre de esa barra; llena en la apertura de la siguiente)
+		//            cierre > maximo => ese dia NO se opera
+		//   cierre = con posicion, la primera barra que cierra a las 15:50 o despues => CERRAR.
+		internal sealed class NucleoMT5
+		{
+			internal const int Nada = 0, Comprar = 1, Cerrar = 2;
+			internal int RangoDesde = 1525, RangoHasta = 1530, SenalHasta = 1535, CierreDesde = 1550, BarrasRango = 5;
+
+			internal DateTime Dia = DateTime.MinValue;   // fecha ET de la ultima barra vista
+			internal double RangoH, RangoL;
+			internal int RangoN;
+			internal string Estado;                       // null = sin decidir | sinRango | rangoIncompleto | sinSenal | alcista | compra
+			internal int SenalHhmm;                       // sello de CIERRE (hhmm ET) de la vela de senal
+			internal double SenalCierre;
+
+			internal int Barra(DateTime cierreEt, double alto, double bajo, double cierre, bool enPosicion)
+			{
+				int hhmm = cierreEt.Hour * 100 + cierreEt.Minute;
+				if (cierreEt.Date != Dia)
+				{
+					Dia = cierreEt.Date;
+					RangoH = double.MinValue; RangoL = double.MaxValue; RangoN = 0;
+					Estado = null; SenalHhmm = 0; SenalCierre = 0;
+					if (enPosicion) return Cerrar;            // una posicion que cruza el dia no es del modelo
+				}
+				if (hhmm > RangoDesde && hhmm <= RangoHasta)
+				{
+					if (alto > RangoH) RangoH = alto;
+					if (bajo < RangoL) RangoL = bajo;
+					RangoN++;
+					return Nada;
+				}
+				if (hhmm > RangoHasta && Estado == null)
+				{
+					if (RangoN == 0) Estado = "sinRango";
+					else if (RangoN != BarrasRango) Estado = "rangoIncompleto";
+					else if (hhmm > SenalHasta) Estado = "sinSenal";
+					else if (cierre > RangoH) { Estado = "alcista"; SenalHhmm = hhmm; SenalCierre = cierre; }
+					else if (cierre < RangoL) { Estado = "compra"; SenalHhmm = hhmm; SenalCierre = cierre; if (!enPosicion) return Comprar; }
+				}
+				if (enPosicion && hhmm >= CierreDesde) return Cerrar;
+				return Nada;
+			}
+
+			/// <summary>El estado del dia en curso dado por cerrado: lo que no llego a decidirse cuenta como lo que es.</summary>
+			internal string EstadoFinal()
+			{
+				if (Estado != null) return Estado;
+				if (RangoN == 0) return "sinRango";
+				if (RangoN != BarrasRango) return "rangoIncompleto";
+				return "sinSenal";
+			}
+		}
+		// ===== NUCLEO-MT5 v1 END =====
+
+		private const string Version    = "MT5 v1";
+		private const string NomEntrada = "MT5L";
+		private const string NomCierre  = "MT5-CIERRE";
+		private const int CanonRiesgo = 250, CanonSL = 100, CanonTP = 150;
+		private static readonly TimeZoneInfo ZonaEt = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+		private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+
+		private TimeZoneInfo tzNt;
+		private bool deshabilitado;
+		private NucleoMT5 nucleo;
+
+		// ── la operación en curso, para la línea MT5CSV ─────────────────────────────────────────
+		private string opDia = "", opVela = "", opTE = "", opTS = "", opMotivo = "";
+		private double opEntNoc, opSalNoc, opRangoH, opRangoL;
+		private int opEntQty, opSalQty;
+		private readonly List<string> lineasCsv = new List<string>();
+
+		#region Parametros
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "RiesgoUSD por operacion", Order = 1, GroupName = "MT5")]
+		public int RiesgoUSD { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "SL (ticks)", Order = 2, GroupName = "MT5")]
+		public int StopTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(1, int.MaxValue)]
+		[Display(Name = "TP (ticks)", Order = 3, GroupName = "MT5")]
+		public int TargetTicks { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Diagnostico (Print por dia)", Order = 4, GroupName = "MT5")]
+		public bool Diagnostico { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "CSV de paridad en ast-libro", Order = 5, GroupName = "MT5")]
+		public bool CsvParidad { get; set; }
+		#endregion
+
+		protected override void OnStateChange()
+		{
+			if (State == State.SetDefaults)
+			{
+				Description = "MT5 v1 · MT5 mejorado (lista de observacion) · MNQ 1 min · rango 15:25-15:29 ET · cierre bajo el minimo en 15:30-15:34 => COMPRA a mercado · SL 100 t · TP 150 t · cierre 15:50 ET";
+				Name        = "MT5";
+				Calculate                    = Calculate.OnBarClose;    // la regla es de cierre de vela
+				EntriesPerDirection          = 1;
+				EntryHandling                = EntryHandling.AllEntries;
+				IsExitOnSessionCloseStrategy = true;                    // red de seguridad: el cierre del modelo es el de las 15:50 ET
+				ExitOnSessionCloseSeconds    = 30;
+				IsFillLimitOnTouch           = false;                   // el TP (limit) llena si ATRAVIESA, como el motor
+				OrderFillResolution          = OrderFillResolution.Standard;
+				Slippage                     = 1;                       // los costes del motor: entrada +1 t, SL y cierre −1 t
+				StartBehavior                = StartBehavior.WaitUntilFlat;
+				TimeInForce                  = TimeInForce.Day;
+				StopTargetHandling           = StopTargetHandling.PerEntryExecution;
+				RealtimeErrorHandling        = RealtimeErrorHandling.StopCancelClose;
+				BarsRequiredToTrade          = 20;
+				IncludeCommission            = true;
+				TraceOrders                  = false;
+
+				RiesgoUSD   = CanonRiesgo;   // canon 250/250/250 de la casa (2026-10-10)
+				StopTicks   = CanonSL;
+				TargetTicks = CanonTP;
+				Diagnostico = false;
+				CsvParidad  = true;
+			}
+			else if (State == State.Configure)
+			{
+				// En ticks desde el precio de LLENADO, como el motor.
+				SetStopLoss(NomEntrada, CalculationMode.Ticks, StopTicks, false);
+				SetProfitTarget(NomEntrada, CalculationMode.Ticks, TargetTicks);
+			}
+			else if (State == State.DataLoaded)
+			{
+				tzNt   = NinjaTrader.Core.Globals.GeneralOptions.TimeZoneInfo;
+				nucleo = new NucleoMT5();
+				lineasCsv.Clear();
+				// ⛔ Guards: la regla se midió barra a barra de 1 minuto y al CIERRE de la vela. En otra cosa el fallo sería SILENCIOSO.
+				if (BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 1)
+				{
+					deshabilitado = true;
+					Log(Version + " DESHABILITADO: hace falta un grafico de 1 MINUTO (recibido " + BarsPeriod.BarsPeriodType + " " + BarsPeriod.Value + ")", LogLevel.Error);
+					Print(Version + " DESHABILITADO: hace falta un grafico de 1 MINUTO");
+					return;
+				}
+				if (Calculate != Calculate.OnBarClose)
+				{
+					deshabilitado = true;
+					Log(Version + " DESHABILITADO: Calculate tiene que ser OnBarClose (recibido " + Calculate + ")", LogLevel.Error);
+					Print(Version + " DESHABILITADO: Calculate tiene que ser OnBarClose");
+					return;
+				}
+				string plantilla = Bars.TradingHours != null ? Bars.TradingHours.Name : "?";
+				Print(Version + " · " + Instrument.FullName + " · reloj de NT: " + tzNt.Id + " -> se decide en ET (" + ZonaEt.Id + ")"
+					+ " · plantilla " + plantilla + " · riesgo $" + RiesgoUSD + " · SL " + StopTicks + " t · TP " + TargetTicks + " t => "
+					+ Contratos() + " contratos · Slippage " + Slippage.ToString("0.##", Inv) + " · " + OrderFillResolution
+					+ " · IsFillLimitOnTouch " + IsFillLimitOnTouch);
+				if (RiesgoUSD != CanonRiesgo || StopTicks != CanonSL || TargetTicks != CanonTP)
+					Print(Version + " AVISO: parametros distintos del canon (riesgo " + CanonRiesgo + " · SL " + CanonSL + " · TP " + CanonTP + "): no es el MT5 de la Lista.");
+				if (Instrument.MasterInstrument.Name != "MNQ")
+					Print(Version + " AVISO: MT5 se midio en MNQ; esto es " + Instrument.MasterInstrument.Name + ".");
+			}
+			else if (State == State.Terminated)
+			{
+				if (Diagnostico && nucleo != null && nucleo.Dia != DateTime.MinValue) Resumen();
+				EscribeCsv();
+			}
+		}
+
+		/// <summary>USD por tick y contrato.</summary>
+		private double ValorTick()
+		{
+			return Instrument.MasterInstrument.PointValue * TickSize;
+		}
+
+		private int Contratos()
+		{
+			return (int)Math.Floor(RiesgoUSD / (StopTicks * ValorTick()) + 1e-9);
+		}
+
+		/// <summary>Hora de Nueva York de un instante del reloj de NT.</summary>
+		private DateTime EtDe(DateTime nt)
+		{
+			DateTime utc = TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(nt, DateTimeKind.Unspecified), tzNt);
+			return TimeZoneInfo.ConvertTimeFromUtc(utc, ZonaEt);
+		}
+
+		/// <summary>«HH:mm» de la vela que CIERRA en hhmm (la etiqueta por apertura del gráfico de Seth).</summary>
+		private static string Apertura(int hhmmCierre)
+		{
+			int m = (hhmmCierre / 100) * 60 + hhmmCierre % 100 - 1;
+			return (m / 60).ToString("00", Inv) + ":" + (m % 60).ToString("00", Inv);
+		}
+
+		private static string Px(double v)
+		{
+			return v.ToString("0.00", Inv);
+		}
+
+		protected override void OnBarUpdate()
+		{
+			if (deshabilitado || BarsInProgress != 0) return;
+			if (CurrentBar < BarsRequiredToTrade) return;
+
+			DateTime et = EtDe(Time[0]);   // Time[0] = CIERRE de la barra
+			if (Diagnostico && nucleo.Dia != DateTime.MinValue && et.Date != nucleo.Dia) Resumen();   // el día que se acaba
+
+			bool largo = Position.MarketPosition == MarketPosition.Long;
+			int accion = nucleo.Barra(et, High[0], Low[0], Close[0], largo);
+
+			if (accion == NucleoMT5.Comprar)
+			{
+				int qty = Contratos();
+				if (qty < 1)
+				{
+					Print(nucleo.Dia.ToString("yyyy-MM-dd", Inv) + " " + Version + " AVISO: con RiesgoUSD " + RiesgoUSD + " y SL " + StopTicks + " t no cabe ni 1 contrato. Hoy no opera.");
+					return;
+				}
+				opRangoH = nucleo.RangoH;
+				opRangoL = nucleo.RangoL;
+				opVela   = Apertura(nucleo.SenalHhmm);
+				EnterLong(qty, NomEntrada);
+				if (Diagnostico)
+					Print(nucleo.Dia.ToString("yyyy-MM-dd", Inv) + " " + Version + " COMPRA " + qty + " a mercado: la vela " + opVela + " cierra en " + Px(nucleo.SenalCierre)
+						+ " bajo el minimo " + Px(nucleo.RangoL) + " (rango " + Px(nucleo.RangoL) + "-" + Px(nucleo.RangoH) + ")");
+			}
+			else if (accion == NucleoMT5.Cerrar && largo)
+			{
+				ExitLong(NomCierre, NomEntrada);
+			}
+		}
+
+		private void Resumen()
+		{
+			string e = nucleo.EstadoFinal();
+			string s = nucleo.Dia.ToString("yyyy-MM-dd", Inv) + " " + Version + " " + e;
+			if (nucleo.RangoN > 0) s += " · rango " + Px(nucleo.RangoL) + "-" + Px(nucleo.RangoH) + " (" + nucleo.RangoN + " barras)";
+			if (nucleo.SenalHhmm > 0) s += " · vela " + Apertura(nucleo.SenalHhmm) + " cierra en " + Px(nucleo.SenalCierre);
+			Print(s);
+		}
+
+		protected override void OnExecutionUpdate(Execution execution, string executionId, double price, int quantity,
+			MarketPosition marketPosition, string orderId, DateTime time)
+		{
+			if (execution == null || execution.Order == null) return;
+			string nom = execution.Order.Name;
+			DateTime tEt = EtDe(time);
+
+			if (nom == NomEntrada)
+			{
+				if (opEntQty == 0)
+				{
+					opDia = tEt.ToString("yyyy-MM-dd", Inv); opTE = tEt.ToString("yyyy-MM-dd HH:mm:ss", Inv);
+					opEntNoc = 0; opSalNoc = 0; opSalQty = 0; opTS = ""; opMotivo = "";
+				}
+				opEntNoc += price * quantity;
+				opEntQty += quantity;
+				return;
+			}
+			if (opEntQty == 0) return;   // una salida sin entrada vista (p. ej. una posición de antes de habilitar)
+
+			opSalNoc += price * quantity;
+			opSalQty += quantity;
+			opTS = tEt.ToString("yyyy-MM-dd HH:mm:ss", Inv);
+			opMotivo = nom == "Stop loss" ? "SL" : nom == "Profit target" ? "TP" : nom == NomCierre ? "CIERRE"
+				: nom == "Exit on session close" ? "SESION" : "NT:" + nom;
+			if (opSalQty < opEntQty) return;   // salida parcial: se espera al resto
+
+			double e = opEntNoc / opEntQty, s = opSalNoc / opSalQty;
+			string linea = opDia + ";" + opVela + ";" + Px(opRangoH) + ";" + Px(opRangoL) + ";" + opTE + ";" + Px(e)
+				+ ";" + Px(e - StopTicks * TickSize) + ";" + Px(e + TargetTicks * TickSize) + ";" + opTS + ";" + Px(s)
+				+ ";" + opMotivo + ";" + opEntQty + ";" + (State == State.Realtime ? "R" : "H");
+			Print("MT5CSV;" + linea);
+			lineasCsv.Add(linea);
+			opEntQty = 0; opSalQty = 0;
+		}
+
+		protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity,
+			int filled, double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string comment)
+		{
+			// Siempre visible, con o sin Diagnostico: un rechazo silencioso es un día perdido sin que nadie lo vea.
+			if (orderState == OrderState.Rejected)
+				Print(EtDe(time).ToString("yyyy-MM-dd HH:mm:ss", Inv) + " " + Version + " RECHAZADA " + order.Name + " · " + error + " · " + comment);
+		}
+
+		/// <summary>Las operaciones de esta corrida a ast-libro\MT5_yyyyMMdd_HHmmss.csv (para cs\paridad-nt8.mjs).</summary>
+		private void EscribeCsv()
+		{
+			if (!CsvParidad || lineasCsv.Count == 0) return;
+			try
+			{
+				string dir = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "ast-libro");
+				if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+				string baseNombre = Name + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", Inv);
+				string ruta = System.IO.Path.Combine(dir, baseNombre + ".csv");
+				for (int k = 2; System.IO.File.Exists(ruta); k++) ruta = System.IO.Path.Combine(dir, baseNombre + "_" + k + ".csv");
+				List<string> todo = new List<string>();
+				todo.Add("# " + Version + " · " + (Instrument != null ? Instrument.FullName : "?") + " · reloj NT " + (tzNt != null ? tzNt.Id : "?")
+					+ " · riesgo " + RiesgoUSD + " · SL " + StopTicks + " · TP " + TargetTicks + " · Slippage " + Slippage.ToString("0.##", Inv)
+					+ " · " + OrderFillResolution + " · IsFillLimitOnTouch " + IsFillLimitOnTouch);
+				todo.Add("fecha;vela;rangoH;rangoL;entradaEt;entrada;sl;tp;salidaEt;salida;motivo;qty;fase");
+				todo.AddRange(lineasCsv);
+				System.IO.File.WriteAllLines(ruta, todo, new UTF8Encoding(false));
+				Print(Version + " CSV de paridad: " + ruta + " (" + lineasCsv.Count + " operaciones)");
+			}
+			catch (Exception ex)
+			{
+				Print(Version + " no pudo escribir el CSV de paridad: " + ex.Message);
+			}
+		}
+	}
+}

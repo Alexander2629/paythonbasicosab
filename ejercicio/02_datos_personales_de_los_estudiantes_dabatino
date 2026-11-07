@@ -1,0 +1,4 @@
+print ("nombre")
+print ("apellido")
+print ("ciudad")
+print ("numero_de_telefono")
