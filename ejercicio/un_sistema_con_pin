@@ -1,0 +1,20 @@
+# Definir el PIN correcto de demostración
+PIN_CORRECTO = "1234"
+intentos_restantes = 3
+
+while intentos_restantes > 0:
+    pin_ingresado = input("Ingrese su PIN: ")
+    
+    # Validar si el PIN es correcto
+    if pin_ingresado == PIN_CORRECTO:
+        print("\nAcceso autorizado.")
+        break
+    else:
+        intentos_restantes -= 1
+        print("\nPIN incorrecto.")
+        
+        # Mostrar los intentos restantes o bloquear si se agotaron
+        if intentos_restantes > 0:
+            print(f"Intentos restantes: {intentos_restantes}\n")
+        else:
+            print("Usuario bloqueado.")
