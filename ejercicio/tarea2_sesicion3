@@ -1,0 +1,38 @@
+
+print("===== FESTIVAL =====")
+
+# Solicitar la edad
+edad = int(input("Ingrese su edad: "))
+
+# Solicitar código promocional
+promo = input("¿Tiene código promocional? (s/n): ").lower()
+
+# Determinar categoría y precio
+if edad < 12:
+    categoria = "Niño"
+    precio = 50
+elif edad >= 12 and edad <= 17:
+    categoria = "Adolescente"
+    precio = 80
+elif edad >= 18 and edad <= 64:
+    categoria = "Adulto"
+    precio = 120
+else:
+    categoria = "Adulto mayor"
+    precio = 70
+
+# Calcular descuento
+if promo == "s":
+    descuento = precio * 0.10
+else:
+    descuento = 0
+
+# Calcular total
+total = precio - descuento
+
+# Mostrar resultados
+print("\n===== FESTIVAL =====")
+print("Categoría:", categoria)
+print("Precio original: C$", format(precio, ".2f"))
+print("Descuento (10%): C$", format(descuento, ".2f"))
+print("Total a pagar: C$", format(total, ".2f"))
