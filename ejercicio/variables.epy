@@ -1,0 +1,19 @@
+nombre = "Alex"
+edad = 100
+estatura = 1.80
+estudiante_activo = True
+
+
+
+print("================")
+print ("Mi presentacion")
+print("================")
+print ("nombre")
+print ("edad")
+print ("estatura")
+print ("estudiante_activo")
+
+print(type(nombre))
+print(type(edad))
+print(type(estatura))
+print(type(estudiante_activo))

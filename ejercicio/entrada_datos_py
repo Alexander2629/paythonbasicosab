@@ -1,0 +1,32 @@
+nombre = input("Ingrese Su Nombre: ")
+
+precio_unitario = float(input("Precio Unitario: "))
+
+#precio_unitario = 125.50
+
+#cantidad = 3
+
+cantidad = int(input("Digita la Cantidad: "))
+
+descuento_porcentaje = 10
+ 
+subtotal = precio_unitario * cantidad
+
+print(subtotal)
+
+print(type(subtotal))
+
+descuento = subtotal * (descuento_porcentaje/100)
+
+total = subtotal - descuento
+ 
+print("RESUMEN DE COMPRA")
+
+print(f"Sub Total: C$ {subtotal:.2f}")
+
+print(f"Descuento: C$ {descuento:.2f}")
+
+print(f"Total: C$ {total:.2f}")
+ 
+print(total >= 300)
+ 
